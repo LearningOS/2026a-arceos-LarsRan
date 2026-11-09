@@ -133,12 +133,21 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
+        // `src_path` and `dst_path` must live in the same mounted filesystem,
+        // so both of them are converted into paths relative to its root.
+        self.lookup_mounted_fs(src_path, |fs, src_rest| {
+            if src_rest.is_empty() {
+                return ax_err!(PermissionDenied); // cannot rename mount points
             }
+            self.lookup_mounted_fs(dst_path, |dst_fs, dst_rest| {
+                if dst_rest.is_empty() {
+                    return ax_err!(PermissionDenied); // cannot overwrite mount points
+                }
+                if !Arc::ptr_eq(&fs, &dst_fs) {
+                    return ax_err!(Unsupported); // moving between filesystems
+                }
+                fs.root_dir().rename(src_rest, dst_rest)
+            })
         })
     }
 }
@@ -301,10 +310,41 @@ pub(crate) fn set_current_dir(path: &str) -> AxResult {
     }
 }
 
-pub(crate) fn rename(old: &str, new: &str) -> AxResult {
-    if parent_node_of(None, new).lookup(new).is_ok() {
-        warn!("dst file already exist, now remove it");
-        remove_file(None, new)?;
+/// Fallback for filesystems that do not implement `rename` natively (e.g.
+/// `ramfs` returns `Unsupported`): copy the file content to the new path, then
+/// remove the old file.
+fn copy_and_remove(src: &str, dst: &str) -> AxResult {
+    let src_node = lookup(None, src)?;
+    if src_node.get_attr()?.is_dir() {
+        return ax_err!(Unsupported); // only files can be renamed this way
     }
-    parent_node_of(None, old).rename(old, new)
+    let dst_node = create_file(None, dst)?;
+    let mut buf = [0u8; 1024];
+    let mut offset = 0u64;
+    loop {
+        let n = src_node.read_at(offset, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dst_node.write_at(offset, &buf[..n])?;
+        offset += n as u64;
+    }
+    remove_file(None, src)
+}
+
+pub(crate) fn rename(old: &str, new: &str) -> AxResult {
+    let old = absolute_path(old)?;
+    let new = absolute_path(new)?;
+    if old == new {
+        return Ok(()); // renaming to itself is a no-op
+    }
+    if lookup(None, &new).is_ok() {
+        warn!("dst file already exist, now remove it");
+        remove_file(None, &new)?;
+    }
+    match ROOT_DIR.rename(&old, &new) {
+        // The filesystem cannot move the node in place, fall back to copy.
+        Err(AxError::Unsupported) => copy_and_remove(&old, &new),
+        ret => ret,
+    }
 }

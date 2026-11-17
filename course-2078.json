@@ -2,8 +2,8 @@
   "schema": 1,
   "courseId": 2078,
   "repository": "LearningOS/2026a-arceos-LarsRan",
-  "commit": "409c366ce1190dc8cd5e0ddad83d3c76ff177097",
-  "score": 300,
+  "commit": "cd775781fcf1c0afe9c2340230508e9afd30df98",
+  "score": 500,
   "totalScore": 600,
   "exercises": [
     {
@@ -30,29 +30,29 @@
     {
       "name": "support_hashmap",
       "max": 100,
-      "score": 0,
-      "status": "fail",
-      "exitCode": 2
+      "score": 100,
+      "status": "pass",
+      "exitCode": 0
     },
     {
       "name": "sys_map",
       "max": 100,
-      "score": 0,
-      "status": "fail",
+      "score": 100,
+      "status": "pass",
       "exitCode": 0
     },
     {
       "name": "simple_hv",
       "max": 100,
       "score": 0,
-      "status": "fail",
-      "exitCode": 0
+      "status": "timeout",
+      "exitCode": 124
     }
   ],
   "student": "LarsRan",
-  "runId": "42629458070",
+  "runId": "44084313350",
   "runAttempt": "1",
   "upload": {
-    "status": "accepted"
+    "status": "pending"
   }
 }

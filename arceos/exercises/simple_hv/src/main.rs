@@ -41,6 +41,12 @@ const BOOT_MAGIC: u64 = 0x6688;
 /// `mhartid` CSR number, decoded from the `csrr` instruction that traps.
 const CSR_MHARTID: usize = 0xF14;
 
+/// Bit 1 of `sstatus`: supervisor interrupt enable.
+const SSTATUS_SIE: usize = 1 << 1;
+
+/// Bit 5 of `sie`: supervisor timer interrupt enable.
+const SIE_STIE: usize = 1 << 5;
+
 #[cfg_attr(feature = "axstd", no_mangle)]
 fn main() {
     ax_println!("Hypervisor ...");
@@ -195,6 +201,33 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters, uspace: &mut AddrSpace) -> bool {
 }
 
 fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
+    // Keep the host from taking interrupts while it drives the guest.
+    //
+    // `_restore_csrs` writes the host `sstatus` back (which has SIE set) *before* it
+    // switches `stvec` back to the host vector, and `_run_guest` installs `stvec`
+    // before it stashes the GuestInfo pointer in `sscratch`. A timer tick landing in
+    // either window is delivered to `_guest_exit`, whose `csrrw a0, sscratch, a0`
+    // then loads the host's `sscratch` (0) instead of the GuestInfo pointer, so the
+    // following `sd ra, 296(a0)` faults on address 0x128 and traps back into
+    // `_guest_exit` forever.
+    //
+    // Disabling SIE alone is not enough: while V = 1 the HS-level timer interrupt is
+    // delivered regardless, and it lands on `_guest_exit` too. Masking the timer
+    // source removes it completely, and SIE is cleared as well so the windows where
+    // the host runs with V = 0 stay quiet.
+    //
+    // Clearing them before the `sstatus::read()` below also keeps the context handed
+    // to the guest consistent with the live CSRs.
+    unsafe {
+        core::arch::asm!(
+            "csrc sstatus, {sie}",
+            "csrc sie, {stie}",
+            sie = in(reg) SSTATUS_SIE,
+            stie = in(reg) SIE_STIE,
+            options(nomem, nostack),
+        );
+    }
+
     // Set hstatus
     let mut hstatus = LocalRegisterCopy::<usize, hstatus::Register>::new(
         riscv::register::hstatus::read().bits(),

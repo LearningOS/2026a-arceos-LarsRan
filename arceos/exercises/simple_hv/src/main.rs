@@ -24,10 +24,22 @@ use csrs::{RiscvCsrTrait, CSR};
 use vcpu::_run_guest;
 use sbi::SbiMessage;
 use loader::load_vm_image;
-use axhal::mem::PhysAddr;
+use axhal::mem::{phys_to_virt, PhysAddr, VirtAddr, PAGE_SIZE_4K};
+use axhal::paging::MappingFlags;
+use axmm::AddrSpace;
+use crate::regs::GprIndex;
 use crate::regs::GprIndex::{A0, A1};
 
 const VM_ENTRY: usize = 0x8020_0000;
+
+/// The hart id reported to the guest when it reads `mhartid`.
+const GUEST_HART_ID: usize = 0x1234;
+
+/// The word the guest expects to load from its fixed boot-info address (GPA 0x40).
+const BOOT_MAGIC: u64 = 0x6688;
+
+/// `mhartid` CSR number, decoded from the `csrr` instruction that traps.
+const CSR_MHARTID: usize = 0xF14;
 
 #[cfg_attr(feature = "axstd", no_mangle)]
 fn main() {
@@ -50,8 +62,7 @@ fn main() {
     prepare_vm_pgtable(ept_root);
 
     // Kick off vm and wait for it to exit.
-    while !run_guest(&mut ctx) {
-    }
+    while !run_guest(&mut ctx, &mut uspace) {}
 
     panic!("Hypervisor ok!");
 }
@@ -63,20 +74,53 @@ fn prepare_vm_pgtable(ept_root: PhysAddr) {
             "csrw hgatp, {hgatp}",
             hgatp = in(reg) hgatp,
         );
-        core::arch::riscv64::hfence_gvma_all();
     }
+    flush_g_stage_tlb();
 }
 
-fn run_guest(ctx: &mut VmCpuRegisters) -> bool {
+/// Flushes the G-stage TLB after the guest page table is modified.
+fn flush_g_stage_tlb() {
+    unsafe { core::arch::riscv64::hfence_gvma_all() };
+}
+
+/// Reads the 32-bit instruction at the guest physical address `gpa`.
+///
+/// The guest runs with a bare VS-stage page table here, so the faulting `sepc`
+/// is a guest physical address and can be looked up in the EPT directly.
+fn read_insn(uspace: &AddrSpace, gpa: usize) -> u32 {
+    let page = gpa & !(PAGE_SIZE_4K - 1);
+    let offset = gpa & (PAGE_SIZE_4K - 1);
+    let (paddr, _, _) = uspace
+        .page_table()
+        .query(VirtAddr::from(page))
+        .expect("cannot translate guest instruction address");
+    unsafe { ((phys_to_virt(paddr).as_usize() + offset) as *const u32).read_volatile() }
+}
+
+/// Adds a zeroed, writable page for the guest physical address `gpa`.
+fn map_guest_page(uspace: &mut AddrSpace, gpa: usize) {
+    let page = gpa & !(PAGE_SIZE_4K - 1);
+    uspace
+        .map_alloc(
+            VirtAddr::from(page),
+            PAGE_SIZE_4K,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+            true,
+        )
+        .unwrap_or_else(|e| panic!("cannot map guest page {:#x}: {:?}", page, e));
+    flush_g_stage_tlb();
+}
+
+fn run_guest(ctx: &mut VmCpuRegisters, uspace: &mut AddrSpace) -> bool {
     unsafe {
         _run_guest(ctx);
     }
 
-    vmexit_handler(ctx)
+    vmexit_handler(ctx, uspace)
 }
 
 #[allow(unreachable_code)]
-fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
+fn vmexit_handler(ctx: &mut VmCpuRegisters, uspace: &mut AddrSpace) -> bool {
     use scause::{Exception, Trap};
 
     let scause = scause::read();
@@ -90,8 +134,8 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                         let a0 = ctx.guest_regs.gprs.reg(A0);
                         let a1 = ctx.guest_regs.gprs.reg(A1);
                         ax_println!("a0 = {:#x}, a1 = {:#x}", a0, a1);
-                        assert_eq!(a0, 0x6688);
-                        assert_eq!(a1, 0x1234);
+                        assert_eq!(a0, BOOT_MAGIC as usize);
+                        assert_eq!(a1, GUEST_HART_ID);
                         ax_println!("Shutdown vm normally!");
                         return true;
                     },
@@ -102,16 +146,41 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
             }
         },
         Trap::Exception(Exception::IllegalInstruction) => {
-            panic!("Bad instruction: {:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
+            // `mhartid` is an M-mode CSR, so a VS-mode guest reading it always traps
+            // here. Emulate the read with the hart id we present to this VM.
+            let insn = read_insn(uspace, ctx.guest_regs.sepc);
+            let rd = (insn >> 7) & 0x1f;
+            let funct3 = (insn >> 12) & 0x7;
+            let csr = (insn >> 20) as usize;
+            if funct3 == 0b010 && csr == CSR_MHARTID {
+                let rd = GprIndex::from_raw(rd).expect("bad rd in csrr");
+                ctx.guest_regs.gprs.set_reg(rd, GUEST_HART_ID);
+                ctx.guest_regs.sepc += 4;
+            } else {
+                panic!(
+                    "Bad instruction: {:#x} sepc: {:#x}",
+                    insn,
+                    ctx.guest_regs.sepc
+                );
+            }
         },
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
+            // The guest reads its boot-info word from a fixed low address that has
+            // no mapping yet: back the page on demand and fill in the value, then
+            // re-execute the faulting load.
+            let gpa = stval::read();
+            map_guest_page(uspace, gpa);
+
+            let page = gpa & !(PAGE_SIZE_4K - 1);
+            let offset = gpa & (PAGE_SIZE_4K - 1);
+            let (paddr, _, _) = uspace
+                .page_table()
+                .query(VirtAddr::from(page))
+                .expect("cannot translate guest data address");
+            unsafe {
+                ((phys_to_virt(paddr).as_usize() + offset) as *mut u64)
+                    .write_volatile(BOOT_MAGIC)
+            };
         },
         _ => {
             panic!(

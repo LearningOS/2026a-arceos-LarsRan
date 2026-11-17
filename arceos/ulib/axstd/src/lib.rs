@@ -55,13 +55,18 @@ extern crate alloc;
 
 #[cfg(feature = "alloc")]
 #[doc(no_inline)]
-pub use alloc::{boxed, collections, format, string, vec};
+pub use alloc::{boxed, format, string, vec};
 
 #[doc(no_inline)]
 pub use core::{arch, cell, cmp, hint, marker, mem, ops, ptr, slice, str};
 
 #[macro_use]
 mod macros;
+
+// `collections` is gated by `alloc`: every collection it exposes (either from
+// `alloc` or from `hashbrown`) needs the global memory allocator.
+#[cfg(feature = "alloc")]
+pub mod collections;
 
 pub mod env;
 pub mod io;

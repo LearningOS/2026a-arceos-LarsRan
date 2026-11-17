@@ -1,13 +1,17 @@
 #![allow(dead_code)]
 
 use core::ffi::{c_void, c_char, c_int};
+use alloc::vec;
 use axhal::arch::TrapFrame;
 use axhal::trap::{register_trap_handler, SYSCALL};
 use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
+use axhal::mem::{MemoryAddr, VirtAddr, PAGE_SIZE_4K};
 use axhal::paging::MappingFlags;
+use axmm::AddrSpace;
 use arceos_posix_api as api;
+use memory_addr::VirtAddrRange;
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -131,16 +135,102 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
+/// The start address the kernel searches for when the user passes a `NULL` hint.
+const MMAP_HINT_BASE: usize = 0x2000_0000;
+
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    let prot = MmapProt::from_bits_truncate(prot);
+    let flags = MmapFlags::from_bits_truncate(flags);
+
+    if length == 0 {
+        return -LinuxError::EINVAL.code() as isize;
+    }
+    // The mapping granularity is a 4K page.
+    let length = (length + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+
+    let curr = current();
+    let mut aspace = curr.task_ext().aspace.lock();
+
+    // Decide where to map.
+    let start = if addr.is_null() {
+        let limit = VirtAddrRange::from_start_size(aspace.base(), aspace.size());
+        match aspace.find_free_area(VirtAddr::from(MMAP_HINT_BASE), length, limit) {
+            Some(vaddr) => vaddr,
+            None => {
+                warn!("sys_mmap: no free area for {:#x} bytes", length);
+                return -LinuxError::ENOMEM.code() as isize;
+            }
+        }
+    } else {
+        let vaddr = VirtAddr::from(addr as usize);
+        if !vaddr.is_aligned_4k() {
+            return -LinuxError::EINVAL.code() as isize;
+        }
+        vaddr
+    };
+
+    // Map physical frames eagerly so that the kernel can fill the content below.
+    if let Err(err) = aspace.map_alloc(start, length, prot.into(), true) {
+        warn!("sys_mmap: cannot map {:#x}..{:#x}: {:?}", start, start + length, err);
+        return -LinuxError::ENOMEM.code() as isize;
+    }
+
+    // Fill the mapping with the file content (not needed for anonymous mappings).
+    if !flags.contains(MmapFlags::MAP_ANONYMOUS) && fd >= 0 {
+        copy_file_to_user(&mut aspace, start, length, fd, offset as usize);
+    }
+
+    start.as_usize() as isize
+}
+
+/// Copies the file content behind `fd` into the user mapping `[start, start + length)`.
+///
+/// The kernel cannot dereference the user virtual address directly, so the data is
+/// transferred chunk by chunk through [`AddrSpace::write`], which walks the page table
+/// and writes into the underlying physical frames.
+///
+/// Note that `length` is page aligned, so the requested `offset` has to be split into
+/// a page aligned file position plus a skip inside the first page.
+fn copy_file_to_user(aspace: &mut AddrSpace, start: VirtAddr, length: usize, fd: i32, offset: usize) {
+    const SEEK_SET: c_int = 0;
+    let page_off = offset & (PAGE_SIZE_4K - 1);
+    let _ = api::sys_lseek(fd, (offset - page_off) as _, SEEK_SET);
+
+    let mut buf = vec![0u8; length.min(PAGE_SIZE_4K)];
+    let mut copied = 0;
+    let mut skip = page_off;
+
+    while copied < length {
+        let want = buf.len().min(length - copied);
+        let n = api::sys_read(fd, buf.as_mut_ptr() as *mut c_void, want);
+        if n <= 0 {
+            break;
+        }
+        let (from, n) = if skip > 0 {
+            let s = skip.min(n as usize);
+            skip -= s;
+            (s, n as usize - s)
+        } else {
+            (0, n as usize)
+        };
+        if n == 0 {
+            continue;
+        }
+        if aspace.write(start + copied, &buf[from..from + n]).is_err() {
+            break;
+        }
+        copied += n;
+        if from + n < want {
+            break; // reached the end of the file
+        }
+    }
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
